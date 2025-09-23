@@ -1,0 +1,102 @@
+services:
+  opa:
+    image: openpolicyagent/opa:1.8.0
+    container_name: opa
+    ports:
+      - "8181:8181"
+    command: >
+      run --server --log-level debug --addr=0.0.0.0:8181 
+      --ignore=.*
+    volumes:
+      - shared-data:/shared
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8181/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    environment:
+      - OPA_LOG_FORMAT=json
+
+  # Initialize OPA with policies and data
+  opa-init:
+    image: curlimages/curl:latest
+    container_name: opa-init
+    user: root
+    depends_on:
+      opa:
+        condition: service_started
+      hydra-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./init:/scripts
+      - ./policies:/policies
+      - shared-data:/shared
+    command: >
+      sh -c "
+        echo 'Initializing OPA policies and data...' &&
+        /scripts/init-opa.sh
+      "
+    environment:
+      - OPA_URL=http://opa:8181
+    restart: "no"
+
+  # OAuth2 Provider (Hydra)
+  hydra:
+    image: oryd/hydra:v2.2.0
+    container_name: hydra
+    command: serve all --dev
+    ports:
+      - "4444:4444"
+      - "4445:4445"
+    environment:
+      - DSN=memory
+      - URLS_SELF_ISSUER=http://127.0.0.1:4444
+      - SECRETS_SYSTEM=youReallyNeedToChangeThis
+      - OIDC_SUBJECT_IDENTIFIERS_SUPPORTED_TYPES=public,pairwise
+      - OIDC_SUBJECT_IDENTIFIERS_PAIRWISE_SALT=youReallyNeedToChangeThis
+
+  # Initialize Hydra with OAuth2 client
+  hydra-init:
+    image: curlimages/curl:latest
+    container_name: hydra-init
+    user: root
+    depends_on:
+      hydra:
+        condition: service_started
+    volumes:
+      - ./init:/scripts
+      - shared-data:/shared
+    command: >
+      sh -c "
+        echo 'Waiting for Hydra...' &&
+        sleep 2 &&
+        echo 'Initializing OAuth2 client...' &&
+        /scripts/init-hydra.sh
+      "
+    environment:
+      - HYDRA_ADMIN_URL=http://hydra:4445
+    restart: "no"
+
+  # Python API Service
+  python-service:
+    build:
+      context: ./python
+      dockerfile: Dockerfile
+    container_name: python-service
+    ports:
+      - "8000:8000"
+    depends_on:
+      opa:
+        condition: service_started
+      hydra:
+        condition: service_started
+    environment:
+      - OPA_URL=http://opa:8181
+      - HYDRA_INTROSPECT_URL=http://hydra:4445/admin/oauth2/introspect
+      - OIDC_ISSUER=http://hydra:4444
+    volumes:
+      - ./python:/app
+      - shared-data:/shared
+
+volumes:
+  shared-data:

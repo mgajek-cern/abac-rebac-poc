@@ -1,0 +1,133 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  migrate:
+    depends_on:
+      postgres:
+        condition: service_started
+    image: openfga/openfga:latest
+    container_name: migrate
+    command: migrate
+    environment:
+      - OPENFGA_DATASTORE_ENGINE=postgres
+      - OPENFGA_DATASTORE_URI=postgres://postgres:password@postgres:5432/postgres?sslmode=disable
+    restart: "no"
+
+  openfga:
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    image: openfga/openfga:latest
+    container_name: openfga
+    environment:
+      - OPENFGA_DATASTORE_ENGINE=postgres
+      - OPENFGA_DATASTORE_URI=postgres://postgres:password@postgres:5432/postgres?sslmode=disable
+      - OPENFGA_LOG_FORMAT=json
+      - OPENFGA_HTTP_CORS_ALLOWED_ORIGINS=*
+      - OPENFGA_HTTP_CORS_ALLOWED_HEADERS=Origin,Content-Length,Content-Type,Authorization,X-Requested-With
+    command: run
+    ports:
+      - "8080:8080"
+      - "8081:8081" 
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # Initialize OpenFGA with store, model, and tuples
+  openfga-init:
+    image: curlimages/curl:latest
+    container_name: openfga-init
+    user: root 
+    depends_on:
+      openfga:
+        condition: service_started
+      hydra-init: 
+        condition: service_completed_successfully
+    volumes:
+      - ./init:/scripts
+      - shared-data:/shared
+    command: >
+      sh -c "
+        echo 'Initializing OpenFGA...' &&
+        /scripts/init-openfga.sh
+      "
+    environment:
+      - OPENFGA_URL=http://openfga:8080
+      - STORE_NAME=demo-store
+    restart: "no"
+
+  mock-oidc:
+    image: oryd/hydra:v2.2.0
+    container_name: hydra
+    command: serve all --dev
+    ports:
+      - "4444:4444"
+      - "4445:4445"
+    environment:
+      - DSN=memory
+      - URLS_SELF_ISSUER=http://127.0.0.1:4444
+      - SECRETS_SYSTEM=youReallyNeedToChangeThis
+      - OIDC_SUBJECT_IDENTIFIERS_SUPPORTED_TYPES=public,pairwise
+      - OIDC_SUBJECT_IDENTIFIERS_PAIRWISE_SALT=youReallyNeedToChangeThis
+
+  # Initialize Hydra with OAuth2 client
+  hydra-init:
+    image: curlimages/curl:latest
+    container_name: hydra-init
+    user: root 
+    depends_on:
+      mock-oidc:
+        condition: service_started
+    volumes:
+      - ./init:/scripts
+      - shared-data:/shared
+    command: >
+      sh -c "
+        echo 'Waiting for Hydra...' &&
+        sleep 2 &&
+        echo 'Initializing OAuth2 client...' &&
+        /scripts/init-hydra.sh
+      "
+    environment:
+      - HYDRA_ADMIN_URL=http://hydra:4445
+    restart: "no"
+
+  python-service:
+    build:
+      context: ./python
+      dockerfile: Dockerfile
+    container_name: python-service
+    ports:
+      - "8000:8000"
+    depends_on:
+      openfga:
+        condition: service_started
+      mock-oidc:
+        condition: service_started
+    environment:
+      - OPENFGA_URL=http://openfga:8080
+      - OPENFGA_STORE_ID_FILE=/shared/openfga-store-id
+      - HYDRA_INTROSPECT_URL=http://hydra:4445/admin/oauth2/introspect
+      - OIDC_ISSUER=http://hydra:4444
+    volumes:
+      - ./python:/app
+      - shared-data:/shared
+
+volumes:
+  postgres_data:
+  shared-data:
