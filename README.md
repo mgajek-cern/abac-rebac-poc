@@ -87,3 +87,7 @@ docker compose up -d --build
 │   └── test-api.sh
 └── README.md
 ```
+
+## License
+
+MIT
